@@ -95,9 +95,9 @@ struct MenuBarLabel: View {
             ))
             .accessibilityHidden(true)
             if style == .withPercent, let highest = highestPercentText {
-                // Spec (2026-09-29): the % text keeps the provider-neutral
-                // label colour; the warning dot on the icon carries the
-                // 80%/95% threshold signal, so the text is never recoloured.
+                // The % text keeps the provider-neutral label colour; the
+                // warning dot on the icon carries the 80% / 95% threshold
+                // signal, so the text is never recoloured.
                 Text(highest)
                     .font(.system(size: 11, weight: .semibold))
                     .monospacedDigit()

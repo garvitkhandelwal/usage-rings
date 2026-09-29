@@ -159,8 +159,8 @@ final class ParserRobustnessTests: XCTestCase {
     // MARK: - Percentages outside 0..100 — clamp display, allow > 100 (second lap)
 
     func testPercentAbove100StillRenders() {
-        // Second lap: 145% must display "145%" (spec: above 100% wraps into
-        // a second lap; the numeric label matches).
+        // Second lap: 145% must display "145%". Above 100% wraps into
+        // a second lap; the numeric label matches.
         XCTAssertEqual(Formatting.percentText(145.0), "145%")
     }
 

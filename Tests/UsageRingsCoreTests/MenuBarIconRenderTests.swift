@@ -96,7 +96,7 @@ final class MenuBarIconRenderTests: XCTestCase {
     }
 
     /// Colour-style ring must be the provider's brand colour regardless of
-    /// colour scheme — spec says provider colours always.
+    /// colour scheme — provider brand colours apply in both light and dark.
     func testColourStyleRingKeepsBrandColourUnderBothSchemes() throws {
         for scheme in [ColorScheme.light, .dark] {
             let image = MenuBarIcon.makeImage(

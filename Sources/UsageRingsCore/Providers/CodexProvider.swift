@@ -346,8 +346,9 @@ public struct CodexProvider: UsageProvider {
         NumericJSON.number(from: raw)
     }
 
-    /// Map `limit_window_seconds` to the display label. The three spec
-    /// constants come first; unknown values fall back to "Nd" for whole-day
+    /// Map `limit_window_seconds` to the display label. The three known
+    /// window constants (5h / weekly / monthly) come first; unknown values
+    /// fall back to "Nd" for whole-day
     /// durations, "Nh" for whole-hour durations, or "Nm" for sub-hour
     /// durations so a 1800-second window reads "30m", not "1h". A broken
     /// value falls back to a generic per-kind label rather than a blank

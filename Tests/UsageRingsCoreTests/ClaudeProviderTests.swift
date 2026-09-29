@@ -56,6 +56,65 @@ final class ClaudeProviderTests: XCTestCase {
         }
     }
 
+    /// Clock stub that yields a scripted sequence of `Date`s in order
+    /// so a test can observe the provider's behaviour when
+    /// `now()` returns different values at the pre-flight expiry check
+    /// vs. the 429 branch check. Falls back to the last provided value
+    /// after the script is exhausted, so a test does not need to
+    /// pre-compute every single call site.
+    final class ClockStub: @unchecked Sendable {
+        private let lock = NSLock()
+        private var times: [Date]
+        private var last: Date
+
+        init(times: [Date]) {
+            precondition(!times.isEmpty)
+            self.times = times
+            self.last = times.first!
+        }
+
+        func next() -> Date {
+            lock.lock(); defer { lock.unlock() }
+            if times.isEmpty { return last }
+            last = times.removeFirst()
+            return last
+        }
+    }
+
+    /// Credential reader that yields a scripted sequence of bodies. Used
+    /// to test the "read → 401 → renew → re-read (new body) → retry"
+    /// path where the second read must observe a different token from
+    /// the first.
+    final class SequentialCredentialReader: ClaudeCredentialReader, @unchecked Sendable {
+        private let lock = NSLock()
+        private var bodies: [Data]
+        private var _readCount = 0
+
+        init(bodies: [Data]) {
+            self.bodies = bodies
+        }
+
+        var readCount: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _readCount
+        }
+
+        func isPresent() async -> Bool { true }
+
+        func read() async throws -> Data {
+            let next: Data? = {
+                lock.lock(); defer { lock.unlock() }
+                _readCount += 1
+                guard !bodies.isEmpty else { return nil }
+                return bodies.removeFirst()
+            }()
+            guard let data = next else {
+                throw FetchError.other("Couldn't read Claude Code credentials from Keychain")
+            }
+            return data
+        }
+    }
+
     /// The shared `RecordingTransport` (see `TestSupport/RecordingTransport.swift`)
     /// is used verbatim; each test builds one bound to `ClaudeProvider.endpoint`
     /// so the returned `HTTPURLResponse.url` matches what production would emit.
@@ -104,9 +163,10 @@ final class ClaudeProviderTests: XCTestCase {
     private func makeProvider(
         credentials: ClaudeCredentialReader,
         transport: HTTPTransport,
+        renewer: any ClaudeCLIRenewer = DisabledClaudeCLIRenewer(),
         now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_780_000_000) }
     ) -> ClaudeProvider {
-        ClaudeProvider(transport: transport, credentials: credentials, now: now)
+        ClaudeProvider(transport: transport, credentials: credentials, renewer: renewer, now: now)
     }
 
     // MARK: - Request construction
@@ -138,7 +198,7 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertEqual(creds.readCallCount, 1, "one read() per fetch()")
     }
 
-    // MARK: - User-Agent (spec: Claude request identity)
+    // MARK: - User-Agent (Claude request identity)
 
     func testFetchSendsClaudeCodeUserAgentHeader() async throws {
         // Without a `claude-code/*` User-Agent the endpoint answers 429
@@ -173,7 +233,7 @@ final class ClaudeProviderTests: XCTestCase {
         let usage = try await provider.fetch()
 
         XCTAssertEqual(usage.id, .claude)
-        XCTAssertNil(usage.plan, "spec: plan name is nil unless explicitly present")
+        XCTAssertNil(usage.plan, "plan name is nil unless explicitly present")
         XCTAssertEqual(usage.fetchedAt, fixedNow)
         XCTAssertEqual(usage.windows.count, 2)
         XCTAssertEqual(creds.readCallCount, 1)
@@ -359,17 +419,40 @@ final class ClaudeProviderTests: XCTestCase {
         XCTAssertEqual(usage.windows.first?.kind, .fiveHour)
     }
 
-    // MARK: - Expired credential still fires the request
+    // MARK: - Pre-flight expiry check
 
-    func testPastExpiresAtStillIssuesTheRequest() async throws {
+    func testPastExpiresAtWithDefaultRenewerSkipsHTTPCall() async throws {
+        // If the stored `expiresAt` is already past, the provider tries
+        // to renew BEFORE hitting the
+        // usage endpoint. With the default `DisabledClaudeCLIRenewer`
+        // that returns `.disabled` and the row is
+        // "Open Claude Code to refresh" — with NO HTTP call fired.
         let pastMs: Int64 = 1_000_000_000_000 // 2001
         let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: pastMs)))
         let transport = makeTransport()
         transport.enqueue(status: 200, body: try fixture())
         let provider = makeProvider(credentials: creds, transport: transport)
 
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+        XCTAssertEqual(transport.requests.count, 0,
+                       "expired credential + disabled renewer must not call the endpoint")
+    }
+
+    func testFutureExpiresAtStillIssuesTheRequest() async throws {
+        // A valid-looking token proceeds to the HTTP call as before.
+        let futureMs: Int64 = 4_102_444_800_000 // 2100
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: futureMs)))
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let provider = makeProvider(credentials: creds, transport: transport)
+
         _ = try await provider.fetch()
-        XCTAssertEqual(transport.requests.count, 1, "past expiresAt must not short-circuit")
+        XCTAssertEqual(transport.requests.count, 1, "future expiresAt must not trigger renewal")
     }
 
     // MARK: - Error paths
@@ -447,7 +530,10 @@ final class ClaudeProviderTests: XCTestCase {
         }
     }
 
-    func testHTTP401MapsToSignedOut() async throws {
+    func testHTTP401WithDefaultRenewerMapsToOpenClaudeCode() async throws {
+        // Default renewer is `DisabledClaudeCLIRenewer`, which returns
+        // `.disabled` — the provider surfaces "Open Claude Code to
+        // refresh" without ever forking the CLI.
         let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
         let transport = makeTransport()
         transport.enqueue(status: 401, body: Data("{\"error\":\"unauthorized\"}".utf8))
@@ -528,6 +614,656 @@ final class ClaudeProviderTests: XCTestCase {
             XCTFail("expected timeout")
         } catch let error as FetchError {
             XCTAssertEqual(error, .timeout)
+        }
+    }
+
+    // MARK: - Delegated CLI renewal
+
+    /// A ClaudeCLIRenewer test double whose outcome is programmable.
+    ///
+    /// `attemptRenewal()` also records how many times it was called so a
+    /// test can assert the provider never called it (toggle-off /
+    /// disabled path) or called it exactly once (retry path).
+    final class FakeClaudeCLIRenewer: ClaudeCLIRenewer, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _outcomes: [ClaudeRenewalOutcome]
+        private var _callCount = 0
+        private var _markIneffectiveCallCount = 0
+
+        init(outcomes: [ClaudeRenewalOutcome]) {
+            self._outcomes = outcomes
+        }
+
+        var callCount: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _callCount
+        }
+
+        var markIneffectiveCallCount: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _markIneffectiveCallCount
+        }
+
+        func attemptRenewal() async -> ClaudeRenewalOutcome {
+            popNextOutcome()
+        }
+
+        func markLastRenewalIneffective() {
+            lock.lock(); defer { lock.unlock() }
+            _markIneffectiveCallCount += 1
+        }
+
+        /// Non-async helper so `NSLock.lock()` (which the Swift 6
+        /// compiler disallows from async contexts) does not leak into
+        /// `attemptRenewal()`.
+        private func popNextOutcome() -> ClaudeRenewalOutcome {
+            lock.lock(); defer { lock.unlock() }
+            _callCount += 1
+            guard !_outcomes.isEmpty else { return .failed }
+            return _outcomes.removeFirst()
+        }
+    }
+
+    func testHTTP401WithSucceededRenewalReReadsCredentialAndRetriesOK() async throws {
+        // Two credential reads: first returns the original (expired-seeming)
+        // token; second returns a "renewed" one. Two HTTP responses: 401
+        // then 200 with the fixture.
+        let originalToken = "sk-ant-oat01-EXPIRED"
+        let renewedToken = "sk-ant-oat01-RENEWED"
+        let firstBody = Self.credentialJSON(token: originalToken)
+        let secondBody = Self.credentialJSON(token: renewedToken)
+        let reader = SequentialCredentialReader(bodies: [firstBody, secondBody])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data("{}".utf8))
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        let usage = try await provider.fetch()
+
+        XCTAssertEqual(renewer.callCount, 1, "renewer must be invoked exactly once on 401")
+        XCTAssertEqual(reader.readCount, 2, "credential must be re-read after successful renewal")
+        XCTAssertEqual(transport.requests.count, 2, "usage call must be retried exactly once")
+        // The retry must carry the NEW token, not the original.
+        XCTAssertEqual(
+            transport.requests[0].value(forHTTPHeaderField: "Authorization"),
+            "Bearer \(originalToken)"
+        )
+        XCTAssertEqual(
+            transport.requests[1].value(forHTTPHeaderField: "Authorization"),
+            "Bearer \(renewedToken)"
+        )
+        XCTAssertEqual(usage.windows.count, 2, "retry parsed the fixture successfully")
+    }
+
+    func testHTTP401ThenRenewalSucceededButRetryStill401YieldsRunClaudeInTerminal() async throws {
+        // The CLI ran but the endpoint still rejects the new token — the
+        // user must resolve it themselves.
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "t1"),
+            Self.credentialJSON(token: "t2")
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+    }
+
+    func testHTTP401WithRenewerFailedYieldsRunClaudeInTerminal() async throws {
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.failed])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(transport.requests.count, 1, "no retry when renewer failed")
+    }
+
+    func testHTTP401WithNoBinaryYieldsOpenClaudeCode() async throws {
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.noBinary])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+    }
+
+    func testHTTP401InCooldownYieldsOpenClaudeCode() async throws {
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.inCooldown])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+    }
+
+    func testHTTP401WithDisabledRenewerYieldsOpenClaudeCode() async throws {
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.disabled])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+    }
+
+    func testDisabledRenewerIsNotCalledOnNon401Responses() async throws {
+        // 200 response — renewer must never be consulted on a successful
+        // fetch. If the provider always called it defensively we would
+        // waste a Claude prompt on every refresh.
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        _ = try await provider.fetch()
+        XCTAssertEqual(renewer.callCount, 0, "renewer must only be consulted on 401")
+    }
+
+    func testHTTP403DoesNotTriggerRenewal() async throws {
+        // 403 is not the "token expired" signal — renewal cannot fix a
+        // permission failure and we do not want to burn Claude usage
+        // pretending it can.
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
+        let transport = makeTransport()
+        transport.enqueue(status: 403, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+        XCTAssertEqual(renewer.callCount, 0)
+    }
+
+    // MARK: - Pre-flight renewal on expired credential
+
+    func testExpiredCredentialPreflightRenewalReReadsAndFetchesExactlyOnce() async throws {
+        // expiresAt past → renew → re-read → one usage call, after renewal.
+        let pastMs: Int64 = 1_000_000_000_000
+        let futureMs: Int64 = 4_102_444_800_000
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "expired-token", expiresAtMs: pastMs),
+            Self.credentialJSON(token: "renewed-token", expiresAtMs: futureMs)
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        let usage = try await provider.fetch()
+
+        XCTAssertEqual(renewer.callCount, 1, "one pre-flight renewal attempt")
+        XCTAssertEqual(reader.readCount, 2, "credential re-read after renewal")
+        XCTAssertEqual(transport.requests.count, 1,
+                       "usage endpoint is called exactly once, after renewal")
+        XCTAssertEqual(
+            transport.requests[0].value(forHTTPHeaderField: "Authorization"),
+            "Bearer renewed-token",
+            "the sole HTTP request must carry the post-renewal token"
+        )
+        XCTAssertEqual(usage.windows.count, 2)
+    }
+
+    func testExpiredCredentialInCooldownSkipsHTTPCall() async throws {
+        // Expired + cooldown → no HTTP call.
+        let pastMs: Int64 = 1_000_000_000_000
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: pastMs)))
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.inCooldown])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+        XCTAssertEqual(transport.requests.count, 0,
+                       "cooldown on an expired credential must not call the endpoint")
+    }
+
+    func testExpiredCredentialInCooldownAfterFailureKeepsRunClaudeText() async throws {
+        // After a failed renewal, keep "Run `claude` in Terminal to
+        // sign in" while the cooldown runs.
+        let pastMs: Int64 = 1_000_000_000_000
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: pastMs)))
+        let transport = makeTransport()
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.inCooldownAfterFailure])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(transport.requests.count, 0)
+    }
+
+    func testExpiredCredentialWithRenewerFailedYieldsRunClaudeAndNoHTTP() async throws {
+        let pastMs: Int64 = 1_000_000_000_000
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: pastMs)))
+        let transport = makeTransport()
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.failed])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(transport.requests.count, 0)
+    }
+
+    func testExpiredCredentialPreflightSucceededThen401MapsToRunClaudeAndNoSecondRenewal() async throws {
+        // Pre-flight succeeded, retry (which is the sole HTTP call this
+        // fetch) returns 401 → "Run `claude` in Terminal to sign
+        // in", NO second renewal attempt inside this fetch, and the
+        // renewer is told the attempt was ineffective so the cooldown
+        // row keeps the same text.
+        let pastMs: Int64 = 1_000_000_000_000
+        let futureMs: Int64 = 4_102_444_800_000
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "expired", expiresAtMs: pastMs),
+            Self.credentialJSON(token: "renewed-but-broken", expiresAtMs: futureMs)
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(renewer.callCount, 1,
+                       "renewer must be called exactly once — the pre-flight — and NOT again on 401")
+        XCTAssertEqual(transport.requests.count, 1,
+                       "usage endpoint is called exactly once, after pre-flight renewal")
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 1,
+                       "provider must tell the renewer the pre-flight was ineffective")
+    }
+
+    func testExpiredCredentialPreflightNoBinaryYieldsOpenClaudeCodeAndNoHTTP() async throws {
+        // Explicit variant of the "no HTTP call" test — a Mac with no
+        // `claude` on disk must never hit the usage endpoint for a
+        // pre-expired token.
+        let pastMs: Int64 = 1_000_000_000_000
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: pastMs)))
+        let transport = makeTransport()
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.noBinary])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+        XCTAssertEqual(transport.requests.count, 0)
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 0)
+    }
+
+    func testExpiredCredentialPreflightSucceededThenReReadFailsMapsToRunClaude() async throws {
+        // If the re-read after a successful pre-flight renewal fails
+        // (or the extracted token is missing), surface
+        // "Run `claude` in Terminal to sign in" — same as the 401
+        // retry path — not the raw reader error, and mark the renewal
+        // ineffective so the cooldown keeps that text.
+        let pastMs: Int64 = 1_000_000_000_000
+        // First read succeeds (returns expired body); second read throws.
+        final class FirstThenThrowingReader: ClaudeCredentialReader, @unchecked Sendable {
+            let firstBody: Data
+            let lock = NSLock()
+            var callCount = 0
+            init(firstBody: Data) { self.firstBody = firstBody }
+            func isPresent() async -> Bool { true }
+            func read() async throws -> Data {
+                let n: Int = { lock.lock(); defer { lock.unlock() }; callCount += 1; return callCount }()
+                if n == 1 { return firstBody }
+                throw FetchError.other("Couldn't read Claude Code credentials from Keychain")
+            }
+        }
+        let reader = FirstThenThrowingReader(firstBody: Self.credentialJSON(expiresAtMs: pastMs))
+        let transport = makeTransport()
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(transport.requests.count, 0,
+                       "re-read failure must NOT be followed by a usage call")
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 1)
+    }
+
+    func testExpiredCredentialPreflightSucceededThenReReadMissingTokenMapsToRunClaude() async throws {
+        // Same guarantee for the "extractAccessToken" branch: a
+        // re-read that succeeds but yields a body without a usable
+        // accessToken must become "Run `claude`", not "Open Claude
+        // Code to refresh" (the raw extractor throws signedOut with
+        // that text) — and must mark the renewal ineffective.
+        let pastMs: Int64 = 1_000_000_000_000
+        let futureMs: Int64 = 4_102_444_800_000
+        let bodyWithoutToken = try JSONSerialization.data(
+            withJSONObject: [
+                "claudeAiOauth": [
+                    "expiresAt": futureMs
+                ] as [String: Any]
+            ]
+        )
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(expiresAtMs: pastMs),
+            bodyWithoutToken
+        ])
+        let transport = makeTransport()
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(transport.requests.count, 0)
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 1)
+    }
+
+    // MARK: - Ineffective renewal marks cooldown correctly
+
+    func testHTTP401RetryReturns429WithReReadStillExpiredMapsToSignedOutNoRetryAfter() async throws {
+        // A 429 received while the stored expiresAt is past is shown
+        // as signed out. This applies not just to the pre-flight
+        // path but also to the 401-retry path — a CLI that "succeeds"
+        // but writes a still-expired credential, followed by a 429 from
+        // the endpoint, must not lock the ring out for a Retry-After
+        // window.
+        let pastMs: Int64 = 1_000_000_000_000
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "t1"),
+            Self.credentialJSON(token: "t2", expiresAtMs: pastMs) // still expired after renewal
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())                              // initial call
+        transport.enqueue(status: 429, body: Data(), headers: ["Retry-After": "3600"]) // retry
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut, not rateLimited")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 1,
+                       "429-while-expired on the retry path must mark the renewal ineffective")
+    }
+
+    func testHTTP401RetryReturns429WithFutureExpiresAtStillMapsToRateLimited() async throws {
+        // Guard against over-eager signed-out mapping: a retry that
+        // gets 429 with a valid-looking new token stays as
+        // `.rateLimited(retryAfter:)` and does NOT mark the renewal
+        // ineffective (the renewal itself worked; the server is just
+        // busy).
+        let futureMs: Int64 = 4_102_444_800_000
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "t1"),
+            Self.credentialJSON(token: "t2", expiresAtMs: futureMs)
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        transport.enqueue(status: 429, body: Data(), headers: ["Retry-After": "45"])
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected rateLimited")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .rateLimited(retryAfter: 45))
+        }
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 0,
+                       "renewer must NOT be marked ineffective for a plain 429 after a good renewal")
+    }
+
+    func testHTTP401RetryReturns5xxDoesNotMarkRenewalIneffective() async throws {
+        // Server-side 5xx is not evidence that the renewal itself
+        // failed. Provider must surface `.server(status)` and leave the
+        // renewer's failure flag alone so the cooldown row does not get
+        // spuriously flipped to "Run `claude` in Terminal to sign in".
+        let futureMs: Int64 = 4_102_444_800_000
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "t1"),
+            Self.credentialJSON(token: "t2", expiresAtMs: futureMs)
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        transport.enqueue(status: 503, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected server")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .server(503))
+        }
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 0,
+                       "renewer must NOT be marked ineffective for a 5xx after a good renewal")
+    }
+
+    func testHTTP401AfterSuccessfulRenewalMarksRenewalIneffective() async throws {
+        // Guardrail for the 401 retry path: the provider must call
+        // `markLastRenewalIneffective()` when a `.succeeded` renewer
+        // outcome is followed by a 401 on the retry. The next
+        // in-cooldown attempt should then return `.inCooldownAfterFailure`.
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "t1"),
+            Self.credentialJSON(token: "t2")
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 401, body: Data())
+        transport.enqueue(status: 401, body: Data())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 1,
+                       "post-successful-renewal 401 must mark the renewal ineffective")
+    }
+
+    func testMissingExpiresAtSkipsPreflightAndProceedsNormally() async throws {
+        // A credential body with no `expiresAt` field must NOT trigger
+        // pre-flight renewal — the pre-check is a hint, not a hard
+        // requirement.
+        let jsonWithoutExpiresAt = try JSONSerialization.data(
+            withJSONObject: [
+                "claudeAiOauth": [
+                    "accessToken": "no-expiry-token",
+                    "scopes": ["a", "b"]
+                ] as [String: Any]
+            ]
+        )
+        let creds = FakeCredentialReader(readResult: .success(jsonWithoutExpiresAt))
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        _ = try await provider.fetch()
+        XCTAssertEqual(renewer.callCount, 0, "missing expiresAt must not trigger pre-flight")
+        XCTAssertEqual(transport.requests.count, 1)
+    }
+
+    func testNonNumericExpiresAtSkipsPreflight() async throws {
+        // If expiresAt is a string (or anything non-numeric) treat it as
+        // "unknown" and proceed as if it were missing.
+        let jsonWithStringExpiresAt = try JSONSerialization.data(
+            withJSONObject: [
+                "claudeAiOauth": [
+                    "accessToken": "tok",
+                    "expiresAt": "not-a-number"
+                ] as [String: Any]
+            ]
+        )
+        let creds = FakeCredentialReader(readResult: .success(jsonWithStringExpiresAt))
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        _ = try await provider.fetch()
+        XCTAssertEqual(renewer.callCount, 0)
+        XCTAssertEqual(transport.requests.count, 1)
+    }
+
+    // MARK: - 429 mapping (expired vs valid tokens)
+
+    func testHTTP429AfterSuccessfulRenewalButRenewedCredentialStillExpiredMapsToSignedOut() async throws {
+        // Pre-flight renewer.succeeded, but the credential re-read
+        // yields an expiresAt that is still past (CLI reported OK but
+        // wrote a bad token). The HTTP call then returns 429; the
+        // provider treats this as signedOut, NOT `.rateLimited`, and
+        // uses the "Run `claude`" flavour because a renewal DID run
+        // this fetch but did not restore access.
+        let pastMs: Int64 = 1_000_000_000_000
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(expiresAtMs: pastMs),
+            Self.credentialJSON(expiresAtMs: pastMs) // still "expired" after renewal
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 429, body: Data(), headers: ["Retry-After": "3600"])
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut, not rateLimited")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 1,
+                       "provider must tell the renewer the attempt was ineffective")
+    }
+
+    func testHTTP429MapsToSignedOutNoRenewalReasonWhenClockAdvancesPastValidExpiry() async throws {
+        // Exercise the `signedOutReasonNoRenewal` branch of the 429
+        // handling. Credential's expiresAt is in the future at read
+        // time (pre-flight is skipped), the HTTP call then takes long
+        // enough that the wall clock advances past that expiry. The
+        // provider re-samples the clock at the 429 branch and treats
+        // the 429 as signedOut. Because no renewal happened this fetch,
+        // the text is "Open Claude Code to refresh", not "Run `claude`".
+        let tokenExpiryMs: Int64 = 1_780_000_000_000 // (Date(timeIntervalSince1970: 1_780_000_000))
+        let clock = ClockStub(times: [
+            Date(timeIntervalSince1970: 1_779_999_990), // pre-flight sample → future
+            Date(timeIntervalSince1970: 1_780_000_010)  // 429 branch sample → past
+        ])
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: tokenExpiryMs)))
+        let transport = makeTransport()
+        transport.enqueue(status: 429, body: Data(), headers: ["Retry-After": "3600"])
+        let renewer = FakeClaudeCLIRenewer(outcomes: [])
+        let provider = makeProvider(
+            credentials: creds,
+            transport: transport,
+            renewer: renewer,
+            now: { clock.next() }
+        )
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+        }
+        XCTAssertEqual(renewer.callCount, 0, "no pre-flight renewal (expiry was future at check time)")
+        XCTAssertEqual(renewer.markIneffectiveCallCount, 0)
+    }
+
+    func testHTTP429WithFutureExpiresAtMapsToRateLimitedAsBefore() async throws {
+        // A valid-looking token that gets rate-limited keeps its old
+        // behaviour: `.rateLimited(retryAfter:)`.
+        let futureMs: Int64 = 4_102_444_800_000
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: futureMs)))
+        let transport = makeTransport()
+        transport.enqueue(status: 429, body: Data(), headers: ["Retry-After": "45"])
+        let provider = makeProvider(credentials: creds, transport: transport)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected rateLimited")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .rateLimited(retryAfter: 45))
+        }
+    }
+
+    func testHTTP429WithMissingExpiresAtMapsToRateLimited() async throws {
+        // No expiresAt → we cannot know if the token is stale → keep the
+        // old 429 behaviour.
+        let json = try JSONSerialization.data(
+            withJSONObject: [
+                "claudeAiOauth": ["accessToken": "t"] as [String: Any]
+            ]
+        )
+        let creds = FakeCredentialReader(readResult: .success(json))
+        let transport = makeTransport()
+        transport.enqueue(status: 429, body: Data(), headers: ["Retry-After": "60"])
+        let provider = makeProvider(credentials: creds, transport: transport)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected rateLimited")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .rateLimited(retryAfter: 60))
         }
     }
 
@@ -901,6 +1637,25 @@ final class ProcessSecurityRunnerTests: XCTestCase {
         // Belt and braces: if the process somehow survived, kill it so the
         // test host is not left with a lingering sleep.
         if alive == 0 { _ = Darwin.kill(pid, SIGKILL) }
+    }
+
+    func testChildInheritsNullStdinNotTheParentsTty() async throws {
+        // If we did NOT redirect stdin to /dev/null, a child reading
+        // from it (`cat` with no args) would inherit the app's stdin
+        // and block indefinitely on read while our 60 s deadline slowly
+        // burned. With stdin = /dev/null, `cat` sees EOF immediately
+        // and exits within milliseconds with empty output.
+        let runner = ProcessSecurityRunner(timeout: 5)
+        let start = Date()
+        let result = try await runner.run(
+            executable: URL(fileURLWithPath: "/bin/cat"),
+            arguments: []
+        )
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(result.status, 0, "cat with stdin = /dev/null must exit cleanly")
+        XCTAssertEqual(result.stdout, Data(), "cat of empty stdin must yield empty stdout")
+        XCTAssertLessThan(elapsed, 1.0,
+                          "cat with stdin = /dev/null must return promptly, not hang on tty read")
     }
 
     func testStderrIsDrainedButNotSurfaced() async throws {

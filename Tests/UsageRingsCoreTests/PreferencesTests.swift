@@ -145,6 +145,54 @@ final class PreferencesTests: XCTestCase {
         XCTAssertEqual(prefs.iconStyle, .colour)
     }
 
+    // MARK: - Renew Claude login automatically
+
+    func testRenewClaudeLoginDefaultsToOn() {
+        let prefs = Preferences(suite: defaults)
+        XCTAssertTrue(prefs.renewClaudeLoginAutomatically,
+                      "Renew Claude login automatically defaults to on")
+    }
+
+    func testRenewClaudeLoginPersistsAfterToggleOff() {
+        let prefs = Preferences(suite: defaults)
+        prefs.setRenewClaudeLoginAutomatically(false)
+        XCTAssertFalse(prefs.renewClaudeLoginAutomatically)
+        let reloaded = Preferences(suite: defaults)
+        XCTAssertFalse(reloaded.renewClaudeLoginAutomatically)
+    }
+
+    func testRenewClaudeLoginPersistsAfterToggleOn() {
+        let prefs = Preferences(suite: defaults)
+        prefs.setRenewClaudeLoginAutomatically(false)
+        prefs.setRenewClaudeLoginAutomatically(true)
+        let reloaded = Preferences(suite: defaults)
+        XCTAssertTrue(reloaded.renewClaudeLoginAutomatically)
+    }
+
+    func testRenewClaudeLoginNonisolatedReaderMirrorsInstanceProperty() {
+        // The `attemptRenewal()` closure runs off the main actor and
+        // reads through this static, so it must return the same value
+        // the SwiftUI toggle sees.
+        let prefs = Preferences(suite: defaults)
+        prefs.setRenewClaudeLoginAutomatically(false)
+        XCTAssertEqual(
+            Preferences.renewClaudeLoginAutomaticallyValue(in: defaults),
+            false
+        )
+        prefs.setRenewClaudeLoginAutomatically(true)
+        XCTAssertEqual(
+            Preferences.renewClaudeLoginAutomaticallyValue(in: defaults),
+            true
+        )
+    }
+
+    func testRenewClaudeLoginNonisolatedReaderDefaultsToOnWhenUnwritten() {
+        XCTAssertEqual(
+            Preferences.renewClaudeLoginAutomaticallyValue(in: defaults),
+            true
+        )
+    }
+
     // MARK: - ProviderID.ringWindowKinds
 
     func testRingWindowKindsDoesNotIncludeOnDemand() {
@@ -221,8 +269,8 @@ final class MenuBarIconTemplatePolicyTests: XCTestCase {
 
 /// Warning dot policy for the menu bar icon.
 ///
-/// The spec (2026-09-29) moved the threshold warning off the whole-icon
-/// tint and onto a small dot at the icon's top-right: amber at ≥ 80%,
+/// The threshold warning is not applied to the whole-icon tint; instead
+/// it appears as a small dot at the icon's top-right: amber at ≥ 80%,
 /// red at ≥ 95%, absent below 80%. Kept in Core so the dot's colour is a
 /// pure function of the (already-rounded) tint level and has one test-covered
 /// source of truth.

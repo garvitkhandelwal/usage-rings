@@ -100,11 +100,40 @@ by the test suite.
   came from. Each token is held in memory only for the duration of one
   request.
 - The app never refreshes, rotates, or rewrites any vendor token. When a
-  token has expired the app shows the signed-out row and asks you to reopen
-  the tool that owns it — the tool refreshes its own token next time it
-  runs. Claude Code's token lasts about 8 hours after the `claude` CLI last
-  ran; if the Claude ring says "Open Claude Code to refresh", run `claude`
-  in a terminal (or `claude auth login` if its session has ended).
+  Codex or Cursor token has expired the app shows the signed-out row and
+  asks you to reopen the tool that owns it — the tool refreshes its own
+  token next time it runs.
+- Claude Code delegated renewal (default on, one setting to turn off).
+  Claude Code's Keychain token is only renewed when the `claude` CLI runs.
+  Working in the Claude desktop app never renews it, so the Claude ring
+  would otherwise get stuck on "Open Claude Code to refresh" for users
+  who never open a terminal. To keep the ring working, on a 401 from
+  Claude's usage endpoint the app runs the user's own `claude` CLI once
+  in the background so the CLI renews its own Keychain token; it then
+  re-reads the Keychain and retries the usage call once.
+  - The exact command (no shell): `<claude> -p "Reply with OK" --model
+    haiku --no-session-persistence --tools "" --strict-mcp-config`.
+  - Working directory: a fresh temporary directory deleted after each
+    attempt. Environment: only `HOME`, `USER`, `LOGNAME`, `PATH`
+    (`/usr/bin:/bin:/usr/sbin:/sbin` plus the directory containing
+    `claude`), and `LANG` — nothing else, in particular no
+    `CLAUDE_*` / `ANTHROPIC_*` variables from your shell profile.
+  - The `claude` binary is located from the first existing candidate of:
+    `~/.local/bin/claude`, `~/.claude/local/claude`,
+    `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`. If none exists,
+    no renewal is attempted.
+  - At most one attempt per 30 minutes (cooldown applies to both
+    successes and failures) and at most one attempt in flight.
+  - Uses a tiny amount of your Claude usage (the one short prompt above)
+    per renewal.
+  - `--no-session-persistence` means no session log is saved for this
+    prompt. The CLI's own output is discarded — the app never writes it
+    to disk or logs it anywhere.
+  - The app itself never writes the Keychain; only the CLI does.
+  - To turn it off: Settings → Claude Code → "Renew Claude login
+    automatically". With the toggle off the Claude ring falls back to
+    the signed-out row ("Open Claude Code to refresh") whenever the
+    token expires.
 - Network traffic is limited to HTTPS calls to:
   - `api.anthropic.com`
   - `chatgpt.com`

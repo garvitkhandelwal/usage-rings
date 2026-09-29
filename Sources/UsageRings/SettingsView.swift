@@ -43,10 +43,11 @@ struct SettingsView: View {
             ringWindowSection
             refreshSection
             iconSection
+            claudeRenewalSection
             launchAtLoginSection
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 520)
+        .frame(width: 460, height: 560)
         // Re-read the system's launch-at-login status every time the
         // Settings window is presented. The user might have flipped it in
         // System Settings between opens, or approved a `.requiresApproval`
@@ -116,6 +117,21 @@ struct SettingsView: View {
                 Text("Monochrome").tag(IconStyle.mono)
                 Text("Colour with percent").tag(IconStyle.withPercent)
             }
+        }
+    }
+
+    private var claudeRenewalSection: some View {
+        Section("Claude Code") {
+            Toggle("Renew Claude login automatically", isOn: Binding(
+                get: { preferences.renewClaudeLoginAutomatically },
+                set: { newValue in
+                    preferences.setRenewClaudeLoginAutomatically(newValue)
+                    onPreferencesChanged()
+                }
+            ))
+            Text("Runs a one-word `claude` prompt when the CLI login has expired; uses a tiny amount of usage.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

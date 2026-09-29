@@ -19,10 +19,10 @@ public enum IconStyle: String, Sendable, Hashable, Codable, CaseIterable {
 ///
 /// Template images are recoloured by AppKit's menu bar system tint — the
 /// right behaviour for the neutral `.mono` icon, and the wrong behaviour
-/// when any ring has crossed the 80 / 95 % thresholds (spec: "its tint
-/// turns amber at 80% and red at 95% on any ring"). If the icon is
-/// template while amber/red, the warning colour vanishes under whatever
-/// tint the menu bar is using.
+/// when any ring has crossed the 80 / 95 % thresholds: the tint turns
+/// amber at 80% and red at 95% on any ring. If the icon is template while
+/// amber/red, the warning colour vanishes under whatever tint the menu
+/// bar is using.
 ///
 /// The rule:
 ///  - When no providers are visible we draw the placeholder outline
@@ -55,10 +55,9 @@ public func shouldDrawMenuBarPlaceholder(entryCount: Int) -> Bool {
 }
 
 /// A coloured warning dot painted at the menu bar icon's top-right when
-/// any visible ring has crossed the 80% / 95% thresholds (spec: UI spec,
-/// menu bar icon, 2026-09-29). The whole icon is never recoloured —
-/// provider rings stay lavender/teal/amber — and only this small dot
-/// signals the warning.
+/// any visible ring has crossed the 80% / 95% thresholds. The whole icon
+/// is never recoloured — provider rings stay lavender/teal/amber — and
+/// only this small dot signals the warning.
 public enum MenuBarWarningDot: Sendable, Hashable {
     case amber
     case red
@@ -128,6 +127,13 @@ public final class Preferences {
     /// Menu bar icon style.
     public private(set) var iconStyle: IconStyle
 
+    /// "Renew Claude login automatically". When on (default), the Claude
+    /// provider runs the user's own `claude` CLI once in the background on
+    /// a 401 so the CLI renews its own Keychain token. When off, the ring
+    /// falls back to "Open Claude Code to refresh" without ever forking
+    /// the CLI. See `ClaudeCLIRenewer` for the exact behaviour.
+    public private(set) var renewClaudeLoginAutomatically: Bool
+
     private let defaults: UserDefaults
 
     // MARK: - Keys
@@ -143,6 +149,7 @@ public final class Preferences {
         }
         static let refreshInterval = "usageRings.refreshIntervalSeconds"
         static let iconStyle = "usageRings.iconStyle"
+        static let renewClaudeLoginAutomatically = "usageRings.renewClaudeLoginAutomatically"
     }
 
     /// Encode for the ring window UserDefaults key. `"auto"` is a reserved
@@ -163,6 +170,7 @@ public final class Preferences {
         self.ringWindow = windows
         self.refreshIntervalSeconds = Self.readRefreshInterval(from: suite)
         self.iconStyle = Self.readIconStyle(from: suite)
+        self.renewClaudeLoginAutomatically = Self.readRenewClaudeLoginAutomatically(from: suite)
     }
 
     // MARK: - Enabled
@@ -244,5 +252,33 @@ public final class Preferences {
             return .colour
         }
         return style
+    }
+
+    // MARK: - Renew Claude login automatically
+
+    public func setRenewClaudeLoginAutomatically(_ value: Bool) {
+        renewClaudeLoginAutomatically = value
+        defaults.set(value, forKey: Key.renewClaudeLoginAutomatically)
+    }
+
+    private static func readRenewClaudeLoginAutomatically(from defaults: UserDefaults) -> Bool {
+        renewClaudeLoginAutomaticallyValue(in: defaults)
+    }
+
+    /// Read-only accessor for the toggle from any actor.
+    ///
+    /// `Preferences` is `@MainActor` because SwiftUI reads / writes it on
+    /// the main thread. The Claude CLI renewer runs inside the Claude
+    /// fetch's child task (non-isolated) and needs to check the toggle on
+    /// every attempt without hopping to the main actor for a boolean
+    /// read. `UserDefaults` is documented as thread-safe, so a
+    /// `nonisolated` static reader against the same key is safe from any
+    /// concurrency context. Defaults to `true` when the toggle has never
+    /// been touched, matching the instance property's semantics.
+    public nonisolated static func renewClaudeLoginAutomaticallyValue(
+        in defaults: UserDefaults = .standard
+    ) -> Bool {
+        if defaults.object(forKey: Key.renewClaudeLoginAutomatically) == nil { return true }
+        return defaults.bool(forKey: Key.renewClaudeLoginAutomatically)
     }
 }

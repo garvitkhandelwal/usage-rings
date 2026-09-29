@@ -12,11 +12,11 @@ import UsageRingsCore
 /// wrappers (Color values from the RGB tuples, track opacity, etc.).
 enum Theme {
 
-    /// Track opacity applied to the ring background circle (spec: 25%).
+    /// Track opacity applied to the ring background circle: 25%.
     static let trackOpacity: Double = 0.25
 
-    /// Provider brand colours in linear-ish sRGB (spec: lavender / teal /
-    /// amber). Kept as raw tuples so `secondLapColor(for:)` can darken them
+    /// Provider brand colours in linear-ish sRGB: lavender / teal / amber.
+    /// Kept as raw tuples so `secondLapColor(for:)` can darken them
     /// through `ColorMath` without a round-trip through opaque `Color`s.
     private static func brandRGB(for id: ProviderID) -> (r: Double, g: Double, b: Double) {
         switch id {

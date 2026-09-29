@@ -121,7 +121,22 @@ final class AppModel {
 
         let transport = URLSessionTransport()
         let credentialReader = SecuritySubprocessCredentialReader()
-        let claude = ClaudeProvider(transport: transport, credentials: credentialReader)
+        // The renewer reads the "Renew Claude login automatically" toggle
+        // fresh on each attempt via the closure below — flipping the
+        // Settings toggle takes effect on the very next 401 without a
+        // provider rebuild. The read goes through the nonisolated
+        // `Preferences.renewClaudeLoginAutomaticallyValue(in:)` static
+        // because `attemptRenewal()` runs inside the Claude fetch's
+        // child task (non-main-actor), and `UserDefaults` is
+        // thread-safe. The renewer holds no reference to `Preferences`.
+        let renewer = DefaultClaudeCLIRenewer(
+            isEnabled: { Preferences.renewClaudeLoginAutomaticallyValue() }
+        )
+        let claude = ClaudeProvider(
+            transport: transport,
+            credentials: credentialReader,
+            renewer: renewer
+        )
         let codex = CodexProvider(transport: transport, auth: FileSystemCodexAuthReader())
         let cursor = CursorProvider(transport: transport, auth: FileSystemCursorAuthReader())
 

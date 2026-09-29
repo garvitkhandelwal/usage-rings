@@ -9,7 +9,7 @@ import UsageRingsCore
 /// A 1-minute `TimelineView` ticker recomputes the relative texts ("N min
 /// ago", "Reset in …") without hitting the network.
 ///
-/// The popover-open refresh (spec: refresh on popover open if data older
+/// The popover-open refresh (refresh on popover open when data is older
 /// than 60 s) is wired through a hidden `WindowVisibilityObserver` NSView
 /// rather than SwiftUI's `onAppear`. `MenuBarExtra(.window)` keeps the
 /// popover's view hierarchy alive across hides on macOS 14 – 26, so

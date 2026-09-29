@@ -77,260 +77,19 @@ public struct ProcessSecurityRunner: SecuritySubprocessRunner {
     }
 
     public func run(executable: URL, arguments: [String]) async throws -> (status: Int32, stdout: Data) {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        // `terminationHandler` fires on the process's private queue whether
-        // the child exited normally or was terminated. Set it before
-        // `run()` so we cannot miss a very-fast child.
-        let exitBox = ExitBox()
-        process.terminationHandler = { p in
-            exitBox.finish(status: p.terminationStatus)
-        }
-
-        // Set up drains before launching so the pipes are draining from the
-        // instant the child starts writing. `AsyncPipeReader` uses
-        // `readabilityHandler`, which fires on a Foundation-owned queue —
-        // no Swift-concurrency thread is blocked for the child's lifetime.
-        let stdoutReader = AsyncPipeReader(fileHandle: stdoutPipe.fileHandleForReading)
-        let stderrReader = AsyncPipeReader(fileHandle: stderrPipe.fileHandleForReading)
-        stdoutReader.begin()
-        stderrReader.begin()
-
         do {
-            try process.run()
-        } catch {
-            stdoutReader.cancel()
-            stderrReader.cancel()
+            return try await runSubprocess(
+                executable: executable,
+                arguments: arguments,
+                environment: nil,
+                currentDirectory: nil,
+                timeout: timeout,
+                killGrace: killGrace
+            )
+        } catch SubprocessRunError.launchFailed {
             throw SecuritySubprocessError.launchFailed
-        }
-
-        let deadlineNS = UInt64(max(0.0, timeout) * 1_000_000_000)
-        let exitStatus: Int32? = await Self.awaitExitOrDeadline(
-            exitBox: exitBox,
-            deadlineNS: deadlineNS
-        )
-
-        guard let status = exitStatus else {
-            // Timeout. SIGTERM immediately; schedule a SIGKILL escalation
-            // on a detached task so the caller returns promptly rather
-            // than waiting on `readabilityHandler` EOF. Killing by PID
-            // (not by the `Process` reference) means we do not need to
-            // capture a non-Sendable `Process` in the detached task.
-            //
-            // PID reuse is unlikely in this short window but not
-            // impossible — the kernel does not police that. Gate the
-            // SIGKILL on the child not having exited yet (as observed by
-            // our own `terminationHandler`, which fires whenever the
-            // child exits): if `exitBox.finished` is already `true` the
-            // child is gone and its PID may have been recycled, so we
-            // must not signal anything.
-            //
-            // This narrows the race but does not close it: the kernel
-            // may reap the child before Foundation dispatches
-            // `terminationHandler`, so a `finished == false` snapshot
-            // is a necessary but not sufficient condition. See
-            // `ExitBox.finished` for the residual-window analysis.
-            let pid = process.processIdentifier
-            process.terminate()
-            let killGraceNS = UInt64(max(0.0, killGrace) * 1_000_000_000)
-            Task.detached { [exitBox] in
-                try? await Task.sleep(nanoseconds: killGraceNS)
-                // Only escalate if we have NOT observed the child exit.
-                // Once `terminationHandler` has fired the PID belongs to
-                // whichever process the kernel next recycled it to; we
-                // must not signal that. See `ExitBox.finished` for why
-                // this narrows but does not eliminate the race.
-                guard !exitBox.finished else { return }
-                if pid > 0 {
-                    _ = Darwin.kill(pid, SIGKILL)
-                }
-            }
-            stdoutReader.cancel()
-            stderrReader.cancel()
+        } catch SubprocessRunError.timedOut {
             throw SecuritySubprocessError.timedOut
-        }
-
-        let stdoutData = await stdoutReader.wait()
-        _ = await stderrReader.wait()
-        return (status, stdoutData)
-    }
-
-    /// Race the process's exit against the caller's deadline, returning
-    /// the exit status if it arrives first or `nil` on timeout. Both racing
-    /// tasks are one-shot: whichever fires first resumes the continuation;
-    /// the loser is a small leak (the sleep task's continuation returns
-    /// nothing) that does not delay the caller.
-    private static func awaitExitOrDeadline(
-        exitBox: ExitBox,
-        deadlineNS: UInt64
-    ) async -> Int32? {
-        let winner = OneShot()
-        return await withCheckedContinuation { (cont: CheckedContinuation<Int32?, Never>) in
-            Task {
-                let status = await exitBox.wait()
-                if winner.fire() {
-                    cont.resume(returning: status)
-                }
-            }
-            Task {
-                _ = try? await Task.sleep(nanoseconds: deadlineNS)
-                if winner.fire() {
-                    cont.resume(returning: nil)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Subprocess plumbing (module-private)
-
-/// Bridges `Process.terminationHandler` (a callback) to an `await`-able
-/// value.
-///
-/// Also exposes a `finished` snapshot the timeout escalator reads to gate
-/// its SIGKILL — once `terminationHandler` has fired for a child, sending
-/// a signal to that PID is unsafe (the kernel may have recycled it).
-private final class ExitBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var status: Int32?
-    private var waiters: [CheckedContinuation<Int32, Never>] = []
-
-    /// `true` once we have OBSERVED the child exit — meaning
-    /// `terminationHandler` has fired and `finish(status:)` recorded it.
-    ///
-    /// The SIGKILL-escalation task reads this snapshot before signalling
-    /// so it can skip a signal to a PID that has already been reused by
-    /// the kernel. Note this is a *narrowing*, not an *elimination*: the
-    /// kernel may reap the child before Foundation calls our
-    /// `terminationHandler`, so `finished == false` does not prove the
-    /// PID is still ours. Holding the lock across `Darwin.kill` would
-    /// not help — the race is kernel-side, not Swift-side. This narrow
-    /// window (roughly the time between the child's `exit(2)` and
-    /// Foundation's callback dispatch, i.e. a Foundation-owned queue
-    /// hop) is the residual risk we accept.
-    var finished: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return status != nil
-    }
-
-    func finish(status: Int32) {
-        lock.lock()
-        self.status = status
-        let toResume = waiters
-        waiters = []
-        lock.unlock()
-        for continuation in toResume {
-            continuation.resume(returning: status)
-        }
-    }
-
-    func wait() async -> Int32 {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
-            lock.lock()
-            if let status {
-                lock.unlock()
-                continuation.resume(returning: status)
-            } else {
-                waiters.append(continuation)
-                lock.unlock()
-            }
-        }
-    }
-}
-
-/// A one-shot flag used to guarantee that a checked continuation is
-/// resumed at most once when two racing tasks might both try.
-private final class OneShot: @unchecked Sendable {
-    private let lock = NSLock()
-    private var fired = false
-    /// Returns `true` for the first caller (which owns the resume) and
-    /// `false` for every subsequent caller.
-    func fire() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if fired { return false }
-        fired = true
-        return true
-    }
-}
-
-/// Non-blocking pipe drain. Uses `readabilityHandler` so the reading
-/// happens on Foundation's file-descriptor queue rather than on a
-/// cooperative-pool thread. `wait()` bridges the accumulated data into
-/// `async` via a checked continuation.
-///
-/// The reader is one-shot: once EOF (empty `availableData`) is observed,
-/// or `cancel()` is called, the internal buffer is delivered to any
-/// waiter and no further data is accepted.
-private final class AsyncPipeReader: @unchecked Sendable {
-    private let fileHandle: FileHandle
-    private let lock = NSLock()
-    private var buffer = Data()
-    private var completed = false
-    private var waiters: [CheckedContinuation<Data, Never>] = []
-
-    init(fileHandle: FileHandle) {
-        self.fileHandle = fileHandle
-    }
-
-    func begin() {
-        // Capture `self` weakly — if the reader has been dropped by the
-        // time the handler fires, there is nothing to accumulate to.
-        fileHandle.readabilityHandler = { [weak self] handle in
-            guard let self else { return }
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                // EOF. Tear down the handler and deliver the buffer.
-                handle.readabilityHandler = nil
-                self.finish()
-            } else {
-                self.append(chunk)
-            }
-        }
-    }
-
-    /// Force completion (deliver whatever we have so far). Used on the
-    /// timeout path: the pipe may not have hit EOF yet — the child is
-    /// still being killed — and we do not want to keep the caller
-    /// waiting on it.
-    func cancel() {
-        fileHandle.readabilityHandler = nil
-        finish()
-    }
-
-    private func append(_ chunk: Data) {
-        lock.lock()
-        if !completed { buffer.append(chunk) }
-        lock.unlock()
-    }
-
-    private func finish() {
-        lock.lock()
-        guard !completed else { lock.unlock(); return }
-        completed = true
-        let result = buffer
-        let toResume = waiters
-        waiters = []
-        lock.unlock()
-        for w in toResume { w.resume(returning: result) }
-    }
-
-    func wait() async -> Data {
-        await withCheckedContinuation { (cont: CheckedContinuation<Data, Never>) in
-            lock.lock()
-            if completed {
-                let result = buffer
-                lock.unlock()
-                cont.resume(returning: result)
-            } else {
-                waiters.append(cont)
-                lock.unlock()
-            }
         }
     }
 }
@@ -447,10 +206,18 @@ public struct SecuritySubprocessCredentialReader: ClaudeCredentialReader {
 
 /// Fetches Claude Code plan usage from `api.anthropic.com`.
 ///
-/// Behaviour: this provider does NOT consult the credential's
-/// client-side `expiresAt` at all. Whether the token is still valid is
-/// the server's call — an HTTP 401 tells us to surface the signed-out
-/// row, and that is the one source of truth this provider consults.
+/// Expiry check: before issuing the usage request, the provider inspects the stored
+/// `claudeAiOauth.expiresAt` (parsed tolerantly as ms since epoch;
+/// missing or non-numeric → treated as unknown). If the stored expiry
+/// has passed, the renewer is called first — an expired token can draw
+/// a 429 from the endpoint (with a ~1 h `Retry-After`) instead of a
+/// 401, and the app must not fall into a "Rate limited" or
+/// long-`Retry-After`-locked-out state for a token it already knows is
+/// stale. See `handleExpiredCredentialByRenewing` below.
+///
+/// The 401 renewal path (`handle401ByRenewingAndRetrying`) is still
+/// used as a safety net: when a token that *looks* valid client-side
+/// is rejected by the server, that is our only signal to renew.
 ///
 /// Parsing rules:
 ///  - `five_hour` → window kind `.fiveHour`, label `"5h"`.
@@ -469,16 +236,42 @@ public struct SecuritySubprocessCredentialReader: ClaudeCredentialReader {
 ///    message, never echoes input).
 ///  - Missing `claudeAiOauth.accessToken` (item exists but the field the
 ///    CLI stores is not there) → `.signedOut("Open Claude Code to refresh")`.
-///  - HTTP 401 / 403 → `.signedOut("Open Claude Code to refresh")`.
-///  - HTTP 429 → `.rateLimited(retryAfter:)`.
+///  - HTTP 401 → attempt delegated CLI renewal (see below). If renewal
+///    succeeded and the retry still returns 401, or renewal itself
+///    failed, → `.signedOut("Run \`claude\` in Terminal to sign in")`.
+///    Otherwise (renewal disabled, no binary, or in cooldown after a
+///    success) → `.signedOut("Open Claude Code to refresh")`. Cooldown
+///    that follows a *failed* attempt keeps the "Run `claude` in
+///    Terminal" text for the whole cooldown window.
+///  - HTTP 403 → `.signedOut("Open Claude Code to refresh")`.
+///  - HTTP 429 while the stored `expiresAt` is past →
+///    `.signedOut(...)` (no `Retry-After` lock-out).
+///  - HTTP 429 with a valid-looking token → `.rateLimited(retryAfter:)`.
 ///  - HTTP 5xx → `.server(status)`.
 ///  - `URLError` connectivity codes → `.offline`; `.timedOut` → `.timeout`.
 ///  - Usage-response body not parseable → `.parse(_)`.
+///
+/// Delegated renewal: when the CLI
+/// token has expired, running the `claude` CLI itself renews the
+/// Keychain item. The provider consults the injected `renewer` in two
+/// places — the pre-flight expiry check described above, and on an
+/// HTTP 401 — and if it returns `.succeeded` re-reads the credential
+/// and retries the usage call ONCE. When the retry still returns 401,
+/// or a 429 arrives while the stored expiry is still past, the
+/// provider calls `renewer.markLastRenewalIneffective()` so the
+/// remainder of the 30-minute cooldown keeps the "Run `claude` in
+/// Terminal to sign in" row instead of flipping to "Open Claude Code
+/// to refresh" one refresh later. The renewer owns the cooldown,
+/// in-flight and binary-lookup logic; the provider only decides which
+/// row message to surface based on the outcome. The provider never
+/// touches the Keychain itself — that is what the CLI's own login
+/// flow does.
 public struct ClaudeProvider: UsageProvider {
     public let id: ProviderID = .claude
 
     private let transport: HTTPTransport
     private let credentials: ClaudeCredentialReader
+    private let renewer: any ClaudeCLIRenewer
     private let now: @Sendable () -> Date
 
     /// The endpoint URL is a literal — not user-configurable.
@@ -491,13 +284,26 @@ public struct ClaudeProvider: UsageProvider {
     /// one-line change.
     public static let userAgent = "claude-code/2.1.0"
 
+    /// Row text when renewal is unavailable (toggle off, no binary, or
+    /// cooldown active): the same "Open Claude Code to refresh" the ring
+    /// used to show unconditionally before delegated renewal existed.
+    static let signedOutReasonNoRenewal = "Open Claude Code to refresh"
+
+    /// Row text after a renewal attempt that ran but did not restore the
+    /// token — either the CLI itself failed, or it succeeded but the
+    /// retried usage call still returned 401. The user needs to interact
+    /// with the CLI directly.
+    static let signedOutReasonRenewalFailed = "Run `claude` in Terminal to sign in"
+
     public init(
         transport: HTTPTransport,
         credentials: ClaudeCredentialReader,
+        renewer: any ClaudeCLIRenewer = DisabledClaudeCLIRenewer(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.transport = transport
         self.credentials = credentials
+        self.renewer = renewer
         self.now = now
     }
 
@@ -506,19 +312,127 @@ public struct ClaudeProvider: UsageProvider {
     }
 
     public func fetch() async throws -> ProviderUsage {
-        let credentialBody = try await readCredential()
-        let token = try extractAccessToken(from: credentialBody)
+        var credentialBody = try await readCredential()
+        var token = try extractAccessToken(from: credentialBody)
+        var storedExpiresAt = extractExpiresAt(from: credentialBody)
 
+        // Pre-flight expiry check. If the stored expiry is already past
+        // when we go to fetch, the endpoint is likely to answer 429 (rate
+        // limited) rather than 401. Trigger the delegated renewal now
+        // — before making
+        // any HTTP call — so a live user does not get stuck on a
+        // "Rate limited" row for the ~1 h Retry-After the endpoint likes
+        // to return for expired tokens.
+        //
+        // On `.succeeded`: re-read the credential (new token, new
+        // expiresAt) and drop into the normal HTTP path — one usage call
+        // total, no second renewal on 401. If the re-read or token
+        // extraction fails despite a successful CLI, tell the renewer
+        // the attempt was ineffective (so the cooldown row remains "Run
+        // `claude`") and surface the same "Run `claude`" text.
+        //
+        // On any non-success renewal outcome: throw the appropriate
+        // signed-out row without ever calling the endpoint.
+        var renewalWasSuccessfulThisFetch = false
+        if let expiresAt = storedExpiresAt, expiresAt <= now() {
+            let outcome = await renewer.attemptRenewal()
+            switch outcome {
+            case .succeeded:
+                do {
+                    credentialBody = try await readCredential()
+                    token = try extractAccessToken(from: credentialBody)
+                    storedExpiresAt = extractExpiresAt(from: credentialBody)
+                    renewalWasSuccessfulThisFetch = true
+                } catch {
+                    // The CLI reported success but we cannot read or
+                    // parse the resulting credential — treat as the
+                    // 401-after-successful-renewal case: mark the
+                    // renewal ineffective and surface the "Run
+                    // `claude`" row. The raw error text (which could
+                    // include our sanitised messages, but for
+                    // consistency with the 401 retry path we do not
+                    // propagate it) is dropped.
+                    renewer.markLastRenewalIneffective()
+                    throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+                }
+            case .failed, .inCooldownAfterFailure:
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            case .disabled, .noBinary, .inCooldown:
+                throw FetchError.signedOut(Self.signedOutReasonNoRenewal)
+            }
+        }
+
+        let (data, response) = try await performUsageRequest(token: token)
+
+        // 401 is the classic delegated-renewal trigger: the token *looks*
+        // valid client-side but the server rejects it. Only attempt
+        // renewal here if we haven't already renewed inside this fetch
+        // — a fresh Keychain token that STILL returns 401 will not be
+        // fixed by another CLI run, and burning a second attempt would
+        // just waste a Claude usage quantum. In that case, tell the
+        // renewer the just-completed attempt was ineffective so the
+        // cooldown row stays on the "Run `claude`" flavour.
+        //
+        // 403 (which the endpoint has never been observed emitting but
+        // the mapper treats the same) surfaces as the plain
+        // "Open Claude Code to refresh" row.
+        if response.statusCode == 401 {
+            if renewalWasSuccessfulThisFetch {
+                renewer.markLastRenewalIneffective()
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            }
+            return try await handle401ByRenewingAndRetrying()
+        }
+
+        // 429 while the stored expiry is past → treat as signed out
+        // rather than as `.rateLimited(retryAfter:)`. Setting a
+        // Retry-After here would ice the Claude ring for the whole
+        // hour-scale value the endpoint returns for expired tokens —
+        // preventing the very next refresh (which might catch a freshly
+        // renewed token) from firing.
+        //
+        // `now()` is re-sampled here (rather than reusing the pre-flight
+        // reading) so a token that was still-future when we read it but
+        // has since aged past its expiry — a plausible outcome when the
+        // network round trip is slow — is caught by this branch instead
+        // of being mis-classified as generic `.rateLimited`.
+        if response.statusCode == 429,
+           let expiresAt = storedExpiresAt,
+           expiresAt <= now() {
+            if renewalWasSuccessfulThisFetch {
+                renewer.markLastRenewalIneffective()
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            }
+            throw FetchError.signedOut(Self.signedOutReasonNoRenewal)
+        }
+
+        if let mapped = HTTPErrorMapper.mapStatus(
+            response.statusCode,
+            response: response,
+            signedOutReason: Self.signedOutReasonNoRenewal
+        ) {
+            throw mapped
+        }
+
+        return try parseUsage(data: data)
+    }
+
+    // MARK: - Request
+
+    /// Build and issue a single Claude usage request with the given
+    /// bearer token. Returns the raw body plus response for the caller
+    /// to inspect (401 vs. other statuses). Non-HTTP transport errors
+    /// (connectivity, timeout) are mapped to `FetchError` here so the
+    /// caller does not have to.
+    private func performUsageRequest(token: String) async throws -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: Self.endpoint)
         request.httpMethod = "GET"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-
-        let (data, response): (Data, HTTPURLResponse)
         do {
-            (data, response) = try await transport.get(request)
+            return try await transport.get(request)
         } catch let fetchError as FetchError {
             throw fetchError
         } catch let urlError as URLError {
@@ -528,16 +442,95 @@ public struct ClaudeProvider: UsageProvider {
             // or headers.
             throw FetchError.other("Network error")
         }
+    }
 
-        if let mapped = HTTPErrorMapper.mapStatus(
-            response.statusCode,
-            response: response,
-            signedOutReason: "Open Claude Code to refresh"
-        ) {
-            throw mapped
+    // MARK: - Renewal path
+
+    /// The 401 renewal loop. The `UsageStore`'s per-provider in-flight
+    /// guard already prevents two concurrent Claude fetches; the
+    /// renewer's own internal lock is a further defensive layer.
+    ///
+    /// - Renewal disabled / no binary / in cooldown after a success →
+    ///   surface the plain `signedOutReasonNoRenewal` row. These are
+    ///   all "we could not even try" outcomes.
+    /// - Renewal succeeded → re-read the credential (a fresh Keychain
+    ///   read; the CLI may have written a new token) and retry the
+    ///   usage call exactly once. If the retry returns 401, or 429
+    ///   while the re-read `expiresAt` is still past, mark the renewal
+    ///   ineffective (so the remaining cooldown window keeps the
+    ///   "Run `claude`" row) and surface `signedOutReasonRenewalFailed`.
+    ///   Other statuses (5xx, 429 with a valid-looking token, unclassified)
+    ///   are mapped normally without marking the renewal ineffective.
+    ///   On success, return the parsed usage.
+    /// - Renewal failed or is in cooldown after a failure → surface
+    ///   `signedOutReasonRenewalFailed`. Never retry inside one fetch
+    ///   beyond the single renew-and-retry cycle; the **renewer's**
+    ///   30-minute cooldown blocks another attempt until the next
+    ///   refresh window.
+    private func handle401ByRenewingAndRetrying() async throws -> ProviderUsage {
+        let outcome = await renewer.attemptRenewal()
+        switch outcome {
+        case .disabled, .noBinary, .inCooldown:
+            throw FetchError.signedOut(Self.signedOutReasonNoRenewal)
+        case .failed, .inCooldownAfterFailure:
+            throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+        case .succeeded:
+            // Re-read the credential. If it now lacks a token, the CLI
+            // wiped the item without re-writing it — treat as the same
+            // "run claude in terminal" outcome, and tell the renewer
+            // its attempt was ineffective so the cooldown window keeps
+            // that text.
+            let newBody: Data
+            do {
+                newBody = try await readCredential()
+            } catch {
+                renewer.markLastRenewalIneffective()
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            }
+            let newToken: String
+            do {
+                newToken = try extractAccessToken(from: newBody)
+            } catch {
+                renewer.markLastRenewalIneffective()
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            }
+            let newExpiresAt = extractExpiresAt(from: newBody)
+            let (retryData, retryResponse) = try await performUsageRequest(token: newToken)
+            if retryResponse.statusCode == 401 {
+                renewer.markLastRenewalIneffective()
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            }
+            // 429 with a re-read expiresAt still in the past → signed
+            // out, no `Retry-After` lock-out: a 429 received while the
+            // stored expiresAt is past is shown as signed out. This is
+            // the same rule the pre-flight branch applies; it must
+            // also cover the 401-retry path when the
+            // CLI wrote a credential whose new expiresAt is still
+            // stale. Marks the renewal ineffective so the cooldown row
+            // keeps the "Run `claude`" text.
+            if retryResponse.statusCode == 429,
+               let expiry = newExpiresAt,
+               expiry <= now() {
+                renewer.markLastRenewalIneffective()
+                throw FetchError.signedOut(Self.signedOutReasonRenewalFailed)
+            }
+            // Any other non-2xx status (429 with a valid-looking token,
+            // 5xx, unclassified) is not evidence that the renewal
+            // itself failed — the token might well be good and the
+            // server is having a bad day. Do NOT mark the renewal
+            // ineffective in these cases; a `.rateLimited(retryAfter:)`
+            // / `.server(status)` / `.other(...)` row surfaces the
+            // real cause. The provider-level in-flight guard already
+            // prevents a second Claude fetch this tick.
+            if let mapped = HTTPErrorMapper.mapStatus(
+                retryResponse.statusCode,
+                response: retryResponse,
+                signedOutReason: Self.signedOutReasonRenewalFailed
+            ) {
+                throw mapped
+            }
+            return try parseUsage(data: retryData)
         }
-
-        return try parseUsage(data: data)
     }
 
     // MARK: - Credential handling
@@ -551,6 +544,31 @@ public struct ClaudeProvider: UsageProvider {
             // Any other reader failure: same sanitised message.
             throw FetchError.other("Couldn't read Claude Code credentials from Keychain")
         }
+    }
+
+    /// Tolerant read of `claudeAiOauth.expiresAt` (milliseconds since
+    /// epoch). Returns `nil` for any body that is not JSON, is not an
+    /// object, is missing the field, or holds a non-numeric value.
+    ///
+    /// The read is deliberately silent on failure: this value is only a
+    /// *hint* used to decide whether to trigger delegated renewal
+    /// pre-flight. A missing or malformed value must not fail the fetch —
+    /// the HTTP call is still the source of truth for whether the token
+    /// is currently accepted by the server.
+    private func extractExpiresAt(from body: Data) -> Date? {
+        guard
+            let json = try? JSONSerialization.jsonObject(with: body, options: []),
+            let root = json as? [String: Any],
+            let oauth = root["claudeAiOauth"] as? [String: Any]
+        else {
+            return nil
+        }
+        // Accept Int, Int64, Double, NSNumber; reject bools and strings.
+        // `NumericJSON.number` already rejects `CFBoolean` bridged values.
+        guard let ms = NumericJSON.number(from: oauth["expiresAt"]) else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: ms / 1000.0)
     }
 
     private func extractAccessToken(from body: Data) throws -> String {

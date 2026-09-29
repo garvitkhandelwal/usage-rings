@@ -13,10 +13,10 @@ import CoreGraphics
 /// ring's radius — half the stroke lies outside the radius, half inside.
 public enum RingGeometry {
 
-    /// Stroke width of each ring, in points (spec: 22 pt).
+    /// Stroke width of each ring, in points.
     public static let strokeWidth: CGFloat = 22
 
-    /// Radial gap between adjacent rings, in points (spec: 4 pt).
+    /// Radial gap between adjacent rings, in points.
     public static let ringGap: CGFloat = 4
 
     /// Fixed side length of the ring square in the popover.
