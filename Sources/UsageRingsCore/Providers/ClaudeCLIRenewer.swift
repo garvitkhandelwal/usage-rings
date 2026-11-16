@@ -155,23 +155,23 @@ public enum ClaudeRenewalOutcome: Sendable, Equatable {
     case failed
 
     /// No candidate binary exists on this Mac. No renewal is possible.
-    /// The provider surfaces "Open Claude Code to refresh".
+    /// The provider surfaces "Run `claude` in Terminal to refresh".
     case noBinary
 
     /// The 30-minute cooldown since the last attempt (which succeeded, or
     /// never happened) has not elapsed. The provider surfaces
-    /// "Open Claude Code to refresh".
+    /// "Run `claude` in Terminal to refresh".
     case inCooldown
 
     /// The 30-minute cooldown after a **failed** attempt has not elapsed.
     /// Distinct from `.inCooldown` so the provider can keep the
     /// "Run `claude` in Terminal to sign in" row visible for the whole
     /// cooldown window, instead of flipping the ring back to
-    /// "Open Claude Code to refresh" after the first refresh.
+    /// "Run `claude` in Terminal to refresh" after the first refresh.
     case inCooldownAfterFailure
 
     /// The "Renew Claude login automatically" setting is off. The provider
-    /// surfaces "Open Claude Code to refresh".
+    /// surfaces "Run `claude` in Terminal to refresh".
     case disabled
 }
 
@@ -194,7 +194,7 @@ public enum ClaudeRenewalOutcome: Sendable, Equatable {
 /// stored expiry was still past). The renewer then treats the pending
 /// cooldown window as if the attempt had failed, so the row keeps
 /// "Run `claude` in Terminal to sign in" for the whole cooldown rather
-/// than flipping to "Open Claude Code to refresh" one refresh later.
+/// than flipping to "Run `claude` in Terminal to refresh" one refresh later.
 public protocol ClaudeCLIRenewer: Sendable {
     func attemptRenewal() async -> ClaudeRenewalOutcome
     /// Called by the caller when a renewal that was reported as
@@ -286,7 +286,7 @@ public final class DefaultClaudeCLIRenewer: ClaudeCLIRenewer, @unchecked Sendabl
     /// Whether the last attempt that landed inside the cooldown window
     /// ended in `.failed`. Used to keep the "Run `claude` in Terminal to
     /// sign in" row visible for the whole cooldown after a bad attempt,
-    /// rather than flipping to "Open Claude Code to refresh" one refresh
+    /// rather than flipping to "Run `claude` in Terminal to refresh" one refresh
     /// later. Reset to `false` on a successful attempt.
     private var lastAttemptFailed = false
     private var inFlight = false
@@ -347,7 +347,7 @@ public final class DefaultClaudeCLIRenewer: ClaudeCLIRenewer, @unchecked Sendabl
         // what the last recorded attempt was — the caller uses the
         // distinction to keep "Run `claude` in Terminal to sign in"
         // visible for the whole cooldown after a failed attempt, instead
-        // of flipping back to "Open Claude Code to refresh" one refresh
+        // of flipping back to "Run `claude` in Terminal to refresh" one refresh
         // later.
         let currentTime = now()
         enum Reservation { case ok, blocked(afterFailure: Bool) }

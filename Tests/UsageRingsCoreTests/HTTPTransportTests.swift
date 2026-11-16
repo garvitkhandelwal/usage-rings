@@ -25,8 +25,8 @@ final class HTTPErrorMapperStatusTests: XCTestCase {
 
     func testUnauthorisedMapsToSignedOutWithReason() {
         XCTAssertEqual(
-            HTTPErrorMapper.mapStatus(401, signedOutReason: "Open Claude Code to refresh"),
-            .signedOut("Open Claude Code to refresh")
+            HTTPErrorMapper.mapStatus(401, signedOutReason: "Run `claude` in Terminal to refresh"),
+            .signedOut("Run `claude` in Terminal to refresh")
         )
     }
 

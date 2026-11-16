@@ -130,7 +130,7 @@ public final class Preferences {
     /// "Renew Claude login automatically". When on (default), the Claude
     /// provider runs the user's own `claude` CLI once in the background on
     /// a 401 so the CLI renews its own Keychain token. When off, the ring
-    /// falls back to "Open Claude Code to refresh" without ever forking
+    /// falls back to "Run `claude` in Terminal to refresh" without ever forking
     /// the CLI. See `ClaudeCLIRenewer` for the exact behaviour.
     public private(set) var renewClaudeLoginAutomatically: Bool
 

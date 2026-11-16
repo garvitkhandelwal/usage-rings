@@ -25,7 +25,7 @@ public enum RowText {
     ///                               (last successful poll happened before a
     ///                               long failure streak).
     ///  - `.offline`               → "No internet connection"
-    ///  - `.signedOut(reason)`     → the reason ("Open Claude Code to refresh")
+    ///  - `.signedOut(reason)`     → the reason ("Run `claude` in Terminal to refresh")
     ///  - `.error(message)`        → the message (already user-facing, short)
     ///  - `.hidden`                → ""
     public static func primaryText(

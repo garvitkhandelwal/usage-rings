@@ -126,7 +126,8 @@ public enum ProviderState: Sendable, Hashable {
     case stale(ProviderUsage, since: Date)
     /// No connectivity — no values shown.
     case offline
-    /// Token expired / not signed in. `reason` is the "Open <Tool> to refresh" hint.
+    /// Token expired / not signed in. `reason` is the hint telling the user
+    /// how to refresh (e.g. "Run `claude` in Terminal to refresh").
     case signedOut(reason: String)
     case error(String)
     /// Not installed on this Mac, or disabled in Settings.

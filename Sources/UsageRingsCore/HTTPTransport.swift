@@ -87,7 +87,7 @@ public enum HTTPErrorMapper {
     ///
     /// - 2xx → `nil`
     /// - 401 / 403 → `.signedOut(reason)` (reason supplied by the caller, so
-    ///   each provider can say "Open Claude Code to refresh" etc.)
+    ///   each provider can say "Run `claude` in Terminal to refresh" etc.)
     /// - 429 → `.rateLimited(retryAfter:)` with `Retry-After` parsed if present
     /// - 5xx → `.server(status)`
     /// - anything else → `.other("HTTP <n>")`

@@ -106,7 +106,7 @@ by the test suite.
 - Claude Code delegated renewal (default on, one setting to turn off).
   Claude Code's Keychain token is only renewed when the `claude` CLI runs.
   Working in the Claude desktop app never renews it, so the Claude ring
-  would otherwise get stuck on "Open Claude Code to refresh" for users
+  would otherwise get stuck on "Run `claude` in Terminal to refresh" for users
   who never open a terminal. To keep the ring working, on a 401 from
   Claude's usage endpoint the app runs the user's own `claude` CLI once
   in the background so the CLI renews its own Keychain token; it then
@@ -132,7 +132,7 @@ by the test suite.
   - The app itself never writes the Keychain; only the CLI does.
   - To turn it off: Settings → Claude Code → "Renew Claude login
     automatically". With the toggle off the Claude ring falls back to
-    the signed-out row ("Open Claude Code to refresh") whenever the
+    the signed-out row ("Run `claude` in Terminal to refresh") whenever the
     token expires.
 - Network traffic is limited to HTTPS calls to:
   - `api.anthropic.com`
@@ -152,6 +152,26 @@ by the test suite.
 Other configurations (Intel Mac, older macOS 14.x releases, other plan
 tiers) are expected to work — the app is a universal binary and the parsers
 are tolerant — but have not been exercised by the author.
+
+## Agent skill: plan-usage
+
+[`skills/plan-usage/`](skills/plan-usage/SKILL.md) is the same usage check
+packaged as an agent skill (a `SKILL.md` plus one Python script), so Claude
+Code, Codex, Cursor and other agents that support skills can answer "how
+much of my plan have I used?" in the terminal. It runs on macOS and Linux
+with Python 3.9+ and needs no packages.
+
+```sh
+python3 -I skills/plan-usage/scripts/usage.py            # all signed-in tools
+python3 -I skills/plan-usage/scripts/usage.py --explain  # what it reads and sends; touches nothing
+```
+
+The agent never handles your tokens: the skill tells it to run the script
+and relay the numbers, and the script sends each token only to its own
+provider over verified HTTPS, refuses redirects, and prints nothing but
+usage. To install it, copy `skills/plan-usage` into your agent's skills
+directory (for Claude Code, `~/.claude/skills/`). Tests:
+`python3 -I -m unittest discover -s skills/tests`.
 
 ## Unofficial endpoints — use at your own risk
 

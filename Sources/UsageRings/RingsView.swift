@@ -124,7 +124,7 @@ private struct RingLayer: View {
             solidTrack(color: .gray)
 
         case .signedOut:
-            // Dashed track — the row text says "Open <Tool> to refresh".
+            // Dashed track — the row text says how to refresh the tool's login.
             dashedTrack(color: baseColor)
 
         case .error:

@@ -204,10 +204,10 @@ final class UsageStoreOutcomeMappingTests: XCTestCase {
     }
 
     func testSignedOutMapsToSignedOut() async {
-        let claude = FakeProvider(id: .claude, outcomes: [.failure(FetchError.signedOut("Open Claude Code to refresh"))])
+        let claude = FakeProvider(id: .claude, outcomes: [.failure(FetchError.signedOut("Run `claude` in Terminal to refresh"))])
         let store = makeStore([claude])
         await store.refreshAll()
-        XCTAssertEqual(store.states[.claude], .signedOut(reason: "Open Claude Code to refresh"))
+        XCTAssertEqual(store.states[.claude], .signedOut(reason: "Run `claude` in Terminal to refresh"))
     }
 
     func testRateLimitedWithoutPreviousBecomesError() async {

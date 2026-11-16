@@ -167,11 +167,11 @@ public struct FileSystemCodexAuthReader: CodexAuthReader {
 ///
 /// Error mapping:
 ///  - Auth reader returns `nil` (file missing or no `tokens`) →
-///    `.signedOut("Open Codex to refresh")` when called via `fetch()`;
+///    `.signedOut("Run \`codex\` in Terminal to refresh")` when called via `fetch()`;
 ///    `isInstalled()` reports `false` so the store hides the ring instead.
 ///  - Auth reader throws → passed through (a parse error surfaces as a
 ///    parse-error row).
-///  - HTTP 401 / 403 → `.signedOut("Open Codex to refresh")`.
+///  - HTTP 401 / 403 → `.signedOut("Run \`codex\` in Terminal to refresh")`.
 ///  - HTTP 429 → `.rateLimited(retryAfter:)`.
 ///  - HTTP 5xx → `.server(status)`.
 ///  - `URLError` connectivity codes → `.offline`; `.timedOut` → `.timeout`.
@@ -232,7 +232,7 @@ public struct CodexProvider: UsageProvider {
         if let mapped = HTTPErrorMapper.mapStatus(
             response.statusCode,
             response: response,
-            signedOutReason: "Open Codex to refresh"
+            signedOutReason: "Run `codex` in Terminal to refresh"
         ) {
             throw mapped
         }
@@ -255,10 +255,10 @@ public struct CodexProvider: UsageProvider {
         guard let credentials else {
             // File missing, or no `tokens` object — either way, the user
             // has no session to talk to the endpoint with. Row says
-            // "Open Codex to refresh"; the ring itself is normally hidden
+            // "Run `codex` in Terminal to refresh"; the ring itself is normally hidden
             // via isInstalled() but a race between isInstalled/fetch will
             // land here.
-            throw FetchError.signedOut("Open Codex to refresh")
+            throw FetchError.signedOut("Run `codex` in Terminal to refresh")
         }
         return credentials
     }

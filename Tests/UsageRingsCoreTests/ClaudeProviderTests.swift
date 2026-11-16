@@ -426,7 +426,7 @@ final class ClaudeProviderTests: XCTestCase {
         // to renew BEFORE hitting the
         // usage endpoint. With the default `DisabledClaudeCLIRenewer`
         // that returns `.disabled` and the row is
-        // "Open Claude Code to refresh" — with NO HTTP call fired.
+        // "Run `claude` in Terminal to refresh" — with NO HTTP call fired.
         let pastMs: Int64 = 1_000_000_000_000 // 2001
         let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(expiresAtMs: pastMs)))
         let transport = makeTransport()
@@ -437,7 +437,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
         XCTAssertEqual(transport.requests.count, 0,
                        "expired credential + disabled renewer must not call the endpoint")
@@ -469,7 +469,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
         XCTAssertEqual(transport.requests.count, 0, "no request must fire when token is missing")
     }
@@ -532,7 +532,7 @@ final class ClaudeProviderTests: XCTestCase {
 
     func testHTTP401WithDefaultRenewerMapsToOpenClaudeCode() async throws {
         // Default renewer is `DisabledClaudeCLIRenewer`, which returns
-        // `.disabled` — the provider surfaces "Open Claude Code to
+        // `.disabled` — the provider surfaces "Run `claude` in Terminal to
         // refresh" without ever forking the CLI.
         let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON()))
         let transport = makeTransport()
@@ -543,7 +543,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
     }
 
@@ -557,7 +557,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
     }
 
@@ -744,7 +744,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
     }
 
@@ -759,7 +759,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
     }
 
@@ -774,7 +774,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
     }
 
@@ -806,7 +806,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
         XCTAssertEqual(renewer.callCount, 0)
     }
@@ -853,7 +853,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
         XCTAssertEqual(transport.requests.count, 0,
                        "cooldown on an expired credential must not call the endpoint")
@@ -938,7 +938,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
         XCTAssertEqual(transport.requests.count, 0)
         XCTAssertEqual(renewer.markIneffectiveCallCount, 0)
@@ -983,8 +983,8 @@ final class ClaudeProviderTests: XCTestCase {
     func testExpiredCredentialPreflightSucceededThenReReadMissingTokenMapsToRunClaude() async throws {
         // Same guarantee for the "extractAccessToken" branch: a
         // re-read that succeeds but yields a body without a usable
-        // accessToken must become "Run `claude`", not "Open Claude
-        // Code to refresh" (the raw extractor throws signedOut with
+        // accessToken must become "Run `claude`", not "Run `claude` in
+        // Terminal to refresh" (the raw extractor throws signedOut with
         // that text) — and must mark the renewal ineffective.
         let pastMs: Int64 = 1_000_000_000_000
         let futureMs: Int64 = 4_102_444_800_000
@@ -1011,6 +1011,47 @@ final class ClaudeProviderTests: XCTestCase {
         }
         XCTAssertEqual(transport.requests.count, 0)
         XCTAssertEqual(renewer.markIneffectiveCallCount, 1)
+    }
+
+    // MARK: - Empty access token (CLI cleared it after a failed refresh)
+
+    func testEmptyAccessTokenWithFailedRenewalMapsToRunClaude() async throws {
+        // When the CLI's own refresh fails it rewrites the Keychain item
+        // with `accessToken: ""` and `expiresAt: 0`. That is an expired
+        // credential, not a missing one: the renewer must be consulted
+        // and, when it fails, the row must say "Run `claude`".
+        let creds = FakeCredentialReader(readResult: .success(Self.credentialJSON(token: "", expiresAtMs: 0)))
+        let transport = makeTransport()
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.failed])
+        let provider = makeProvider(credentials: creds, transport: transport, renewer: renewer)
+
+        do {
+            _ = try await provider.fetch()
+            XCTFail("expected signedOut")
+        } catch let error as FetchError {
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to sign in"))
+        }
+        XCTAssertEqual(renewer.callCount, 1)
+        XCTAssertEqual(transport.requests.count, 0)
+    }
+
+    func testEmptyAccessTokenWithSucceededRenewalFetchesUsage() async throws {
+        // Same cleared credential, but the CLI renews successfully: the
+        // provider re-reads the item and makes exactly one usage call.
+        let reader = SequentialCredentialReader(bodies: [
+            Self.credentialJSON(token: "", expiresAtMs: 4_102_444_800_000),
+            Self.credentialJSON(token: "sk-ant-oat01-RENEWED")
+        ])
+        let transport = makeTransport()
+        transport.enqueue(status: 200, body: try fixture())
+        let renewer = FakeClaudeCLIRenewer(outcomes: [.succeeded])
+        let provider = makeProvider(credentials: reader, transport: transport, renewer: renewer)
+
+        _ = try await provider.fetch()
+        XCTAssertEqual(renewer.callCount, 1)
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertEqual(transport.requests.first?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer sk-ant-oat01-RENEWED")
     }
 
     // MARK: - Ineffective renewal marks cooldown correctly
@@ -1202,7 +1243,7 @@ final class ClaudeProviderTests: XCTestCase {
         // enough that the wall clock advances past that expiry. The
         // provider re-samples the clock at the 429 branch and treats
         // the 429 as signedOut. Because no renewal happened this fetch,
-        // the text is "Open Claude Code to refresh", not "Run `claude`".
+        // the text is "Run `claude` in Terminal to refresh", not "Run `claude`".
         let tokenExpiryMs: Int64 = 1_780_000_000_000 // (Date(timeIntervalSince1970: 1_780_000_000))
         let clock = ClockStub(times: [
             Date(timeIntervalSince1970: 1_779_999_990), // pre-flight sample → future
@@ -1223,7 +1264,7 @@ final class ClaudeProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Claude Code to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `claude` in Terminal to refresh"))
         }
         XCTAssertEqual(renewer.callCount, 0, "no pre-flight renewal (expiry was future at check time)")
         XCTAssertEqual(renewer.markIneffectiveCallCount, 0)

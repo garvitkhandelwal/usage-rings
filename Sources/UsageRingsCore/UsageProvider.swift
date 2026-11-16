@@ -34,8 +34,8 @@ public protocol UsageProvider: Sendable {
 /// associated `String` payloads case-insensitively or anything clever, it is
 /// the derived synthesised comparison.
 public enum FetchError: Error, Equatable, Sendable {
-    /// 401 / 403 or an equivalent local signal. `String` is the "Open <Tool>
-    /// to refresh" hint the row displays.
+    /// 401 / 403 or an equivalent local signal. `String` is the hint the row
+    /// displays (e.g. "Run `claude` in Terminal to refresh").
     case signedOut(String)
     /// 429. `retryAfter` is parsed from the `Retry-After` header, in seconds.
     case rateLimited(retryAfter: TimeInterval?)

@@ -499,7 +499,7 @@ final class CodexProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Codex to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `codex` in Terminal to refresh"))
         } catch {
             XCTFail("wrong error: \(error)")
         }
@@ -536,7 +536,7 @@ final class CodexProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Codex to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `codex` in Terminal to refresh"))
         }
     }
 
@@ -550,7 +550,7 @@ final class CodexProviderTests: XCTestCase {
             _ = try await provider.fetch()
             XCTFail("expected signedOut")
         } catch let error as FetchError {
-            XCTAssertEqual(error, .signedOut("Open Codex to refresh"))
+            XCTAssertEqual(error, .signedOut("Run `codex` in Terminal to refresh"))
         }
     }
 

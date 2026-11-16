@@ -288,7 +288,7 @@ final class DefaultClaudeCLIRenewerTests: XCTestCase {
     func testCooldownAfterSuccessDoesNotFlagFailure() async {
         // A successful attempt within the cooldown must return
         // `.inCooldown` (not `.inCooldownAfterFailure`) so the provider
-        // surfaces the plain "Open Claude Code to refresh" row.
+        // surfaces the plain "Run `claude` in Terminal to refresh" row.
         let clock = TestClock(start: Date(timeIntervalSince1970: 1_800_000_000))
         let runner = FakeClaudeCLIProcessRunner(responses: [.success(0)])
         let renewer = makeRenewer(runner: runner, now: { clock.read() })

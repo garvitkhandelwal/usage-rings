@@ -53,8 +53,8 @@ final class RowTextTests: XCTestCase {
 
     func testSignedOutText() {
         XCTAssertEqual(
-            RowText.primaryText(state: .signedOut(reason: "Open Claude Code to refresh"), now: now),
-            "Open Claude Code to refresh"
+            RowText.primaryText(state: .signedOut(reason: "Run `claude` in Terminal to refresh"), now: now),
+            "Run `claude` in Terminal to refresh"
         )
     }
 

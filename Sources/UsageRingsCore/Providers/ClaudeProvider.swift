@@ -234,16 +234,17 @@ public struct SecuritySubprocessCredentialReader: ClaudeCredentialReader {
 /// Error mapping:
 ///  - Credential body could not be parsed as JSON → `.parse(_)` (fixed
 ///    message, never echoes input).
-///  - Missing `claudeAiOauth.accessToken` (item exists but the field the
-///    CLI stores is not there) → `.signedOut("Open Claude Code to refresh")`.
+///  - Missing or empty `claudeAiOauth.accessToken` (the CLI clears it,
+///    and zeroes `expiresAt`, when its own refresh fails) → treated as
+///    expired: same pre-flight renewal path as a past `expiresAt`.
 ///  - HTTP 401 → attempt delegated CLI renewal (see below). If renewal
 ///    succeeded and the retry still returns 401, or renewal itself
 ///    failed, → `.signedOut("Run \`claude\` in Terminal to sign in")`.
 ///    Otherwise (renewal disabled, no binary, or in cooldown after a
-///    success) → `.signedOut("Open Claude Code to refresh")`. Cooldown
+///    success) → `.signedOut("Run \`claude\` in Terminal to refresh")`. Cooldown
 ///    that follows a *failed* attempt keeps the "Run `claude` in
 ///    Terminal" text for the whole cooldown window.
-///  - HTTP 403 → `.signedOut("Open Claude Code to refresh")`.
+///  - HTTP 403 → `.signedOut("Run \`claude\` in Terminal to refresh")`.
 ///  - HTTP 429 while the stored `expiresAt` is past →
 ///    `.signedOut(...)` (no `Retry-After` lock-out).
 ///  - HTTP 429 with a valid-looking token → `.rateLimited(retryAfter:)`.
@@ -260,8 +261,8 @@ public struct SecuritySubprocessCredentialReader: ClaudeCredentialReader {
 /// or a 429 arrives while the stored expiry is still past, the
 /// provider calls `renewer.markLastRenewalIneffective()` so the
 /// remainder of the 30-minute cooldown keeps the "Run `claude` in
-/// Terminal to sign in" row instead of flipping to "Open Claude Code
-/// to refresh" one refresh later. The renewer owns the cooldown,
+/// Terminal to sign in" row instead of flipping to "Run `claude` in
+/// Terminal to refresh" one refresh later. The renewer owns the cooldown,
 /// in-flight and binary-lookup logic; the provider only decides which
 /// row message to surface based on the outcome. The provider never
 /// touches the Keychain itself — that is what the CLI's own login
@@ -285,9 +286,9 @@ public struct ClaudeProvider: UsageProvider {
     public static let userAgent = "claude-code/2.1.0"
 
     /// Row text when renewal is unavailable (toggle off, no binary, or
-    /// cooldown active): the same "Open Claude Code to refresh" the ring
-    /// used to show unconditionally before delegated renewal existed.
-    static let signedOutReasonNoRenewal = "Open Claude Code to refresh"
+    /// cooldown active). Only the `claude` CLI renews this token — the
+    /// desktop app and the browser never do — so the hint names the CLI.
+    static let signedOutReasonNoRenewal = "Run `claude` in Terminal to refresh"
 
     /// Row text after a renewal attempt that ran but did not restore the
     /// token — either the CLI itself failed, or it succeeded but the
@@ -313,7 +314,7 @@ public struct ClaudeProvider: UsageProvider {
 
     public func fetch() async throws -> ProviderUsage {
         var credentialBody = try await readCredential()
-        var token = try extractAccessToken(from: credentialBody)
+        let storedToken = try extractAccessTokenIfPresent(from: credentialBody)
         var storedExpiresAt = extractExpiresAt(from: credentialBody)
 
         // Pre-flight expiry check. If the stored expiry is already past
@@ -333,8 +334,13 @@ public struct ClaudeProvider: UsageProvider {
         //
         // On any non-success renewal outcome: throw the appropriate
         // signed-out row without ever calling the endpoint.
+        //
+        // An empty or missing accessToken is treated the same way: the
+        // CLI clears the token (and zeroes `expiresAt`) when its own
+        // refresh fails, so the item is expired rather than absent.
         var renewalWasSuccessfulThisFetch = false
-        if let expiresAt = storedExpiresAt, expiresAt <= now() {
+        var token = storedToken ?? ""
+        if storedToken == nil || storedExpiresAt.map({ $0 <= now() }) == true {
             let outcome = await renewer.attemptRenewal()
             switch outcome {
             case .succeeded:
@@ -375,7 +381,7 @@ public struct ClaudeProvider: UsageProvider {
         //
         // 403 (which the endpoint has never been observed emitting but
         // the mapper treats the same) surfaces as the plain
-        // "Open Claude Code to refresh" row.
+        // "Run `claude` in Terminal to refresh" row.
         if response.statusCode == 401 {
             if renewalWasSuccessfulThisFetch {
                 renewer.markLastRenewalIneffective()
@@ -572,6 +578,18 @@ public struct ClaudeProvider: UsageProvider {
     }
 
     private func extractAccessToken(from body: Data) throws -> String {
+        guard let token = try extractAccessTokenIfPresent(from: body) else {
+            // The Keychain item exists and parses as JSON but does not carry
+            // a usable accessToken.
+            throw FetchError.signedOut(Self.signedOutReasonNoRenewal)
+        }
+        return token
+    }
+
+    /// Like `extractAccessToken`, but returns `nil` instead of throwing
+    /// when the body parses and the token is missing or empty. Parse
+    /// failures still throw.
+    private func extractAccessTokenIfPresent(from body: Data) throws -> String? {
         let json: Any
         do {
             json = try JSONSerialization.jsonObject(with: body, options: [])
@@ -588,10 +606,7 @@ public struct ClaudeProvider: UsageProvider {
             let token = oauth["accessToken"] as? String,
             !token.isEmpty
         else {
-            // The Keychain item exists and parses as JSON but does not carry
-            // a usable accessToken. Ask the user to reopen Claude Code so
-            // its own login flow can rewrite the item.
-            throw FetchError.signedOut("Open Claude Code to refresh")
+            return nil
         }
         return token
     }
